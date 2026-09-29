@@ -9842,6 +9842,44 @@ def _urls_name_repo(urls: set[str], canonical: str) -> bool:
     return all(_repo_identity_from_url(u) == want for u in urls)
 
 
+def _no_pr_block_applies(urls: set[str]) -> bool:
+    """Whether the no-open-PR BLOCK enforces for a push to ``urls``.
+
+    Scoped to the configured PUBLIC repo only — the declared
+    ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``,
+    the same source ``_scheduled_gate_applies`` uses. The reason it has to be
+    scoped at all is that the thing being enforced is not a property of branches
+    in general: ``ci.yml`` and the leak detector live in THIS repo and trigger on
+    ``pull_request`` to ITS default branch. On a private fork, on the backups
+    repo, on the voice repo, on any unrelated checkout a session wanders into,
+    "this branch has no open PR" is an ordinary state with no consequence — and
+    blocking it would refuse routine work for a reason that does not exist there.
+
+    Scoped by the push DESTINATION, not by the repo ``gh`` resolves for the
+    checkout. The two differ whenever ``branch.<name>.pushRemote`` or
+    ``remote.pushDefault`` points at a fork, and it is the destination that
+    decides whether CI will ever see the branch. Every URL must name the public
+    repo (``_urls_name_repo`` is ALL, host included). It is also a pure local
+    comparison — no second ``gh`` round-trip that could time out after the count
+    already answered.
+
+    **THE FAIL DIRECTION IS THE OPPOSITE OF ITS SIBLING, and that is deliberate.**
+    ``_scheduled_gate_applies`` returns True when the repo is undeterminable,
+    because silently skipping would be an evasion path on the very repo it
+    protects. Here an undeterminable repo returns False. The asymmetry follows
+    from what each failure costs: that gate withholds a MERGE, which a human is
+    standing over and can override with a sigil; this one refuses a PUSH, in
+    every session on the box, for a hygiene property — so a config this hook
+    cannot read, or push URLs it cannot resolve, would wedge ordinary work
+    everywhere with no way through and no way to tell why.
+    """
+    canonical = _canonical_public_repo()
+    if not canonical:
+        return False  # no declared public repo → nothing to scope to → do not block
+    # `github.user`/`github.public_repo` name a github.com repository.
+    return _urls_name_repo(urls, f"https://github.com/{canonical}")
+
+
 def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
     """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
 
@@ -10084,6 +10122,11 @@ def _run_merge_and_push_gates() -> int:
     blind_spot_deny: str | None = None
     round_compound_deny: str | None = None
     round_autonomous_deny: str | None = None
+    #: A re-push to a branch on the CONFIGURED PUBLIC repo that has no open PR.
+    #: A BLOCK there, because PR-less public branches kept accumulating under
+    #: the ask. Everywhere else the ask is unchanged. Scoped by
+    #: `_no_pr_block_applies`. See the site below.
+    no_open_pr_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -10498,23 +10541,51 @@ def _run_merge_and_push_gates() -> int:
                             f"separate commands so each is judged on the state it "
                             f"actually runs in."
                         )
+                    # NO `gh pr create` exemption: whether a same-command create
+                    # yields a PR for THIS branch is not decidable from argv
+                    # (another --head, --dry-run, a failing create before `&&`,
+                    # a configured merge base). The ordinary push-then-create
+                    # flow is a first push and never reaches this arm.
+                    #
                     # A DRY RUN publishes nothing, so it cannot create the
-                    # unchecked-branch state this prompt reports. `-n` and
-                    # `--dry-run` are both accepted by the predicate above, so
-                    # they reach here; asking about them is pure friction on an
-                    # inspection command.
+                    # unchecked-branch state. `-n` and `--dry-run` both reach here
+                    # via the predicate above; refusing an inspection command is
+                    # pure friction.
+                    #
                     elif (
                         push_allow_reason
                         and not _push_is_dry_run(push_segs[0])
                         and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
                     ):
                         push_allow_reason = None
-                        ask_reason = (
-                            f"re-push to '{cur}': this branch is PUBLIC but has "
-                            f"NO OPEN PR, so CI and the leak scan never run on "
-                            f"it. Approve to push, then open its PR "
-                            f"(gh pr create) — or close the branch out."
-                        )
+                        if _no_pr_block_applies(urls):
+                            # BLOCKED on the public repo: PR-less branches kept
+                            # accumulating there under the ask (2 of 60 public
+                            # branches on 2026-09-25, both after the previous
+                            # cleanup). Only a RE-push reaches here; the first
+                            # push must stay open, since `gh pr create` needs the
+                            # branch on the remote. Dispatched sessions never get
+                            # here (`_is_dispatched()` denies every push above).
+                            no_open_pr_deny = (
+                                f"BLOCKED: re-push to '{cur}' — this branch is "
+                                f"PUBLIC but has NO OPEN PR, so CI and the leak "
+                                f"detector never run on it (ci.yml triggers on "
+                                f"pull_request; a branch with no PR matches no "
+                                f"trigger).\n"
+                                f"Open its PR first — `gh pr create` — then push "
+                                f"again. Or close the branch out if it is "
+                                f"finished with. Both leave the branch in a state "
+                                f"something actually looks at."
+                            )
+                        else:
+                            # Off the public repo — or when the public repo is not
+                            # declared — the pre-existing ask, unchanged.
+                            ask_reason = (
+                                f"re-push to '{cur}': this branch is PUBLIC but has "
+                                f"NO OPEN PR, so CI and the leak scan never run on "
+                                f"it. Approve to push, then open its PR "
+                                f"(gh pr create) — or close the branch out."
+                            )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
@@ -11228,6 +11299,9 @@ def _run_merge_and_push_gates() -> int:
             return 2
         if round_autonomous_deny is not None:
             print(round_autonomous_deny, file=sys.stderr)
+            return 2
+        if no_open_pr_deny is not None:
+            print(no_open_pr_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
             return _ask(ask_reason)

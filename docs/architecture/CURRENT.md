@@ -1440,6 +1440,47 @@ verified: 84c7259d 2026-08-31
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
   `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
   the same measurement to the container.
+- **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
+  (during an outage's diagnosis that is about hourly, since the tick is a
+  oneshot). The tiers above only alert, and a thin pool once filled to 100%
+  under six-hourly CRITICALs because the space was held by the guardian's own
+  healthy snapshot. Two layers now free guardian-owned space:
+  - `snapshots.mark_healthy` rotates **delete-first** when the pool refused
+    the create on a real measurement of a NAMED pool, the lifeline is ≥23h
+    old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
+    live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
+    lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    The settle is reserved before the delete. Healthy snapshots are never
+    retention-evicted before a create. A refused refresh retries in ~1h
+    (own `.last_healthy` marker) and alerts, throttled.
+  - relief deletes ONE guardian snapshot per pass when free data ≤
+    `min_reserve_pct` (3%) or free metadata ≤ `min_meta_reserve_pct` (10%):
+    pre-recovery oldest first, then superseded healthy, the lifeline last;
+    a failed delete falls through to the next unless the client timed out
+    (outcome unknown → stop and alert); 5-minute settle stamped before
+    the delete (delete-first starts it too); pool identity re-checked first.
+    `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
+    delete never falls through to the lifeline. Pool identity is incus's
+    DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
+    only lvm (thin), btrfs and dir are measured — others are undetected. Unable to measure, read or name the pool for 1h →
+    daily WARNING. Rollback (healthy) snapshots have ONE deletion chokepoint,
+    `SnapshotManager.delete_healthy` (plain `delete` refuses them): allowed
+    only with a just-created replacement or THIS tick's probe-confirmed
+    HEALTHY (`check._probe_confirmed_healthy`: the last `signal_history`
+    entry is from this tick and `all_alive` — NOT the state, which also
+    reaches HEALTHY with the container down via auto-reset/unpause); the
+    daily healthy refresh uses the same verdict. Relief runs a pre-cycle pass (non-healthy only) and a post-cycle
+    pass (healthy allowed when the probe said HEALTHY); prune and pre-create
+    retention never delete a healthy snapshot; a retention eviction defers
+    delete-first. The snapshot gate shares relief's admission rule
+    (`unactionable`) and trusts only validated tiers/reserves.
+  - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
+    `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
+    (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
+    unmeasured or ambiguous pool (unknown backend, several thin pools).
+  - Levers: `storage_pool.relief_mode` (`live`/`alert_only`/`off`) and
+    `GUARDIAN_POOL_RELIEF_DISABLED=1`. Runbook:
+    `docs/reference/thin-pool-recovery.md`.
 - **Container-swap invariant reconciler** (`swap_watch.py`) runs every tick:
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the

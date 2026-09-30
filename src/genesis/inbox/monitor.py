@@ -1866,6 +1866,7 @@ class InboxMonitor:
             # (it forwards session_origin_from_env), so a delta forged here is
             # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
+            caller_tag="inbox.eval",
         )
 
     async def _set_drop_status(
@@ -2711,8 +2712,10 @@ class InboxMonitor:
                 )
 
             # Capability-build lane (non-fatal, no-op unless enabled + wired):
-            # consumes `build` verdicts into greenlight cards. Independent of
-            # follow-up creation — BUILD verdicts never become follow-ups.
+            # consumes `build` verdicts into greenlight cards. While it is live,
+            # BUILD verdicts never become follow-ups; when it is unwired or
+            # disabled, _create_follow_ups_from_eval surfaces them as follow-ups
+            # instead (see _BUILD_FALLBACK_MAP).
             if self._build_lane is not None:
                 try:
                     await self._build_lane.handle_eval(
@@ -2724,6 +2727,16 @@ class InboxMonitor:
                 except Exception:
                     logger.warning(
                         "Build-lane eval handling failed (non-fatal)",
+                        exc_info=True,
+                    )
+                # Runs even when handle_eval raised part-way: retirement keys on
+                # a candidate row EXISTING, so it retires exactly what the lane
+                # did consume and nothing it did not.
+                try:
+                    await self._retire_build_fallbacks_owned_by_lane(output_text)
+                except Exception:
+                    logger.warning(
+                        "Retiring lane-off BUILD fallback rows failed (non-fatal)",
                         exc_info=True,
                     )
 
@@ -3127,6 +3140,111 @@ class InboxMonitor:
         "bookmark": ("ego_judgment", "low", False, "tabled"),
     }
 
+    # BUILD (capability-build items) is deliberately ABSENT from _ACTION_MAP and
+    # stays in recommendation._SKIP_ACTIONS: while the build lane is live it owns
+    # the verdict's lifecycle (greenlight card -> task executor), and a follow-up
+    # as well would be a duplicate. But the lane is optional — unwired, or wired
+    # with ``enabled=False`` (its handle_eval then returns 0 without looking) — and
+    # in that state a BUILD verdict used to reach NO consumer at all: skipped here
+    # by is_actionable, ignored there by the disabled lane. So when the lane is not
+    # live, the verdict is surfaced here instead — mapped by the VERDICT, never by
+    # the action alone, because ``action: BUILD`` carries all three verdicts:
+    #   build            -> pinned user-owned follow-up (the greenlight decision)
+    #   needs_discussion -> pinned user-owned follow-up, labelled as a discussion
+    #   dont_build       -> tabled record (a veto is kept, never actionable work)
+    # A missing/invalid verdict (parsed as None) is malformed output: the live lane
+    # skips it too (BuildLane.handle_eval), so it creates nothing and logs WARNING.
+    _BUILD_FALLBACK_MAP: dict[str, tuple[str, str, bool, str, str]] = {
+        # verdict -> (strategy, priority, pinned, kind, content label)
+        "build": ("user_input_needed", "medium", True, "follow_up", "BUILD"),
+        "needs_discussion": (
+            "user_input_needed", "medium", True, "follow_up", "BUILD: NEEDS DISCUSSION",
+        ),
+        "dont_build": ("ego_judgment", "low", False, "tabled", "BUILD: DONT_BUILD"),
+    }
+
+    def _build_lane_live(self) -> bool:
+        """True only when a build lane is wired AND enabled (it will consume)."""
+        lane = self._build_lane
+        return lane is not None and bool(getattr(lane, "enabled", False))
+
+    @staticmethod
+    def _item_primary(title: str) -> str:
+        """Stable item identity: the tracking-normalized primary URL in the title,
+        else the lowercased title. The same derivation as BuildLane.item_key, so a
+        fallback row and a lane candidate name the same item."""
+        urls = extract_urls(title)
+        return normalize_url_line(urls[0]) if urls else title.strip().lower()
+
+    @staticmethod
+    def _build_fallback_dedup_key(primary: str, verdict: str) -> str:
+        """dedup_key of the lane-off BUILD fallback row for *primary* + *verdict*."""
+        basis = f"inbox_build_fallback|{primary}|verdict={verdict}"
+        return hashlib.sha256(basis.encode()).hexdigest()
+
+    async def _retire_build_fallbacks_owned_by_lane(self, evaluation_text: str) -> int:
+        """Retire lane-off BUILD fallback rows for items the live lane now owns.
+
+        A BUILD item evaluated while the lane was off got a fallback row (see
+        _BUILD_FALLBACK_MAP). Once the lane is enabled and the item is
+        re-evaluated, the lane records a build_candidate (and, for ``build``, a
+        greenlight card); left alone, the fallback would stay actionable as a
+        stale duplicate of that card.
+
+        Ownership is read from the candidate table, not from what handle_eval
+        returned, so every way the lane can hold an item is covered by the one
+        check: a candidate it created in this eval, a card or calibration row
+        from an earlier eval (handle_eval then skips it as already tracked), and
+        an insert race another writer won. The fallback rows of ALL three
+        verdicts for that item are retired — the lane now owns the item's
+        decision whatever the fallback had recorded. Rows are completed with a
+        note, never deleted; ones already taken up or closed are left alone.
+        """
+        if not self._build_lane_live():
+            return 0
+
+        from genesis.autonomy.build_lane import BuildLane
+        from genesis.db.crud import build_candidates, follow_ups
+        from genesis.inbox.recommendation import parse_recommendations
+
+        retired = 0
+        for rec in parse_recommendations(evaluation_text):
+            # Same filter as BuildLane.handle_eval: only these can be consumed.
+            if rec.verdict is None:
+                continue
+            title = (rec.item_title or "").strip()
+            if not title:
+                continue
+            candidate = await build_candidates.get_any_by_item_key(
+                self._db, BuildLane.item_key(title),
+            )
+            if not candidate:
+                continue
+            primary = self._item_primary(title)
+            keys = [
+                self._build_fallback_dedup_key(primary, verdict)
+                for verdict in self._BUILD_FALLBACK_MAP
+            ]
+            n = await follow_ups.retire_by_dedup_keys(
+                self._db,
+                keys,
+                note=(
+                    "Retired: the build lane is now live and owns this item "
+                    f"(build candidate {candidate.get('id', '?')}, verdict "
+                    f"{candidate.get('verdict', '?')}). This lane-off fallback "
+                    "would duplicate its greenlight/calibration record."
+                ),
+            )
+            if n:
+                logger.info(
+                    "Retired %d lane-off BUILD fallback row(s) for %r — the build "
+                    "lane now owns it",
+                    n,
+                    title,
+                )
+            retired += n
+        return retired
+
     async def _create_follow_ups_from_eval(
         self,
         evaluation_text: str,
@@ -3141,19 +3259,59 @@ class InboxMonitor:
         import hashlib
         import sqlite3
 
-        from genesis.db.crud import follow_ups
+        from genesis.autonomy.build_lane import BuildLane, build_spec_usable
+        from genesis.db.crud import build_candidates, follow_ups
         from genesis.inbox.recommendation import parse_recommendations
 
         recs = parse_recommendations(evaluation_text)
         created = 0
         source_name = ", ".join(Path(f).name for f in source_files)
 
+        build_lane_live = self._build_lane_live()
+
         for rec in recs:
-            if not rec.is_actionable:
+            action_key = rec.action.lower().replace("_", " ").strip()
+            build_fallback = action_key == "build" and not build_lane_live
+            if not rec.is_actionable and not build_fallback:
                 continue
 
-            action_key = rec.action.lower().replace("_", " ").strip()
-            mapping = self._ACTION_MAP.get(action_key)
+            title = rec.item_title or "Untitled"
+            label = rec.action.upper()
+            effective_verdict = rec.verdict
+            spec_downgraded = False
+            if build_fallback:
+                # The mirror of _retire_build_fallbacks_owned_by_lane: an item the
+                # lane already owns (a candidate from a period when it was live)
+                # keeps that record as its decision — the lane's own permanent
+                # dedup would skip it too — so disabling the lane afterwards must
+                # not re-ask it as a fallback beside the existing card.
+                lane_title = (rec.item_title or "").strip()
+                if lane_title and await build_candidates.get_any_by_item_key(
+                    self._db, BuildLane.item_key(lane_title),
+                ):
+                    logger.info(
+                        "Build lane not live, but %r already has a build candidate "
+                        "— no fallback row (the lane's record stands)",
+                        lane_title,
+                    )
+                    continue
+                if effective_verdict == "build" and not build_spec_usable(rec.build_spec):
+                    # Parity with BuildLane._handle_build: an unusable
+                    # build_spec fails closed to needs_discussion.
+                    effective_verdict = "needs_discussion"
+                    spec_downgraded = True
+                build_mapping = self._BUILD_FALLBACK_MAP.get(effective_verdict or "")
+                if build_mapping is None:
+                    logger.warning(
+                        "Build lane not live and BUILD recommendation for %r has "
+                        "no valid verdict — creating nothing (malformed eval)",
+                        title,
+                    )
+                    continue
+                *mapping_fields, label = build_mapping
+                mapping = tuple(mapping_fields)
+            else:
+                mapping = self._ACTION_MAP.get(action_key)
             if mapping is None:
                 logger.debug(
                     "Unmapped action '%s' — skipping follow-up",
@@ -3163,24 +3321,48 @@ class InboxMonitor:
 
             strategy, priority, pinned, kind = mapping
 
-            title = rec.item_title or "Untitled"
-            content = f"[{rec.action.upper()}] {title}: {rec.next_step}"
+            content = f"[{label}] {title}: {rec.next_step}"
             reason = (
                 f"Inbox evaluation {batch_id[:8]}: {source_name}. "
                 f"Confidence: {rec.confidence}. Effort: {rec.effort}."
             )
+            if build_fallback:
+                reason += (
+                    " Build lane not live — capability-build verdict recorded "
+                    f"here instead. Verdict: {rec.verdict}."
+                )
+                if spec_downgraded:
+                    reason += (
+                        " build_spec missing or incomplete — recorded as "
+                        "needs_discussion, as the build lane would."
+                    )
+                if rec.verdict_reason:
+                    reason += f" Verdict reason: {rec.verdict_reason}"
+                logger.info(
+                    "Build lane not live — BUILD verdict for %r (verdict=%s) "
+                    "routed to a %s row",
+                    title,
+                    effective_verdict,
+                    kind,
+                )
 
             # Dedup: skip if an identical recommendation already exists so that
             # re-evaluating the same URL (or overlapping drops) never piles up
             # duplicate follow-up rows. Key on the item's primary URL
             # (tracking-normalized) or title + the next_step.
-            urls_in_title = extract_urls(title)
-            primary = (
-                normalize_url_line(urls_in_title[0]) if urls_in_title else title.strip().lower()
-            )
-            dedup_key = hashlib.sha256(
-                f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}".encode()
-            ).hexdigest()
+            primary = self._item_primary(title)
+            if build_fallback:
+                # BUILD fallback keys on stable item identity + verdict, like
+                # BuildLane.item_key: next_step is LLM prose that is rephrased
+                # across evaluations (it would duplicate the decision), while a
+                # changed verdict IS a new decision and must not be deduped away.
+                # effective_verdict is a _BUILD_FALLBACK_MAP key here (checked above).
+                dedup_key = self._build_fallback_dedup_key(primary, effective_verdict)
+            else:
+                dedup_basis = (
+                    f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
+                )
+                dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
             if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)
                 continue

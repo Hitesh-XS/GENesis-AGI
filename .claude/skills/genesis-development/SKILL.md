@@ -3143,6 +3143,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
   Run gate-adjacent steps as separate calls.
+- **A secrets.env access that did NOT prompt may have been silenced, or may
+  have escaped the guard.** The guard matches only some access paths, so an
+  unprompted access proves nothing by itself. An install may set
+  `hooks.asks.secrets_env: off` in `~/.genesis/config/genesis.yaml`, which
+  removes the credentials guard's prompt: the hook then emits no decision, only
+  a context note naming the setting. That note is what proves a silenced
+  access; with no note, assume the access went past the guard unseen. It
+  approves nothing; other hooks and Claude Code's own permissions still decide
+  the command, and a dispatched session is still denied. `secrets_env` is the
+  ONLY key. The push / PR-open prompt has none on purpose: it is where code
+  leaves the machine, so it stays a decision on every install.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending

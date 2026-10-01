@@ -464,6 +464,23 @@ main() {
             || echo "reconcile ghost-export prune exited $?"
     fi
 
+    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
+    # update.sh saves local edits to the tracked ephemeral files it discards before
+    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
+    # run. Written once and never touched again, so a directory's mtime is its age.
+    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
+    # which spares a tree that is or holds a mount), over the CANONICAL root.
+    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
+        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
+        while IFS= read -r -d '' _pmb_dir; do
+            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
+                || echo "premerge-backups prune failed or spared $_pmb_dir"
+        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
+    fi
+
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.
     #

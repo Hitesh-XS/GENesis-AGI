@@ -55,7 +55,8 @@ _acquire_deploy_marker() {
         _other="$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || true)"
         if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && [ "$_other" != "$$" ] \
             && _deploy_marker_holder_live "$_other"; then
-            export DEPLOY_MARKER_HOLDER="$_other"
+            # shellcheck disable=SC2034 # Read by scripts/update.sh to identify the refusing holder.
+            DEPLOY_MARKER_HOLDER="$_other"
             return 1
         fi
     fi
